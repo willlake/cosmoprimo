@@ -937,3 +937,94 @@ def test_a_file_written_before_the_growth_convention_changed_is_refused():
     state['version'] = 1
     with pytest.raises(StateVersionError):
         type(emulator).from_state(state)
+
+
+def test_the_log_fit_predicts_the_same_spectrum_and_is_saved(tmp_path):
+    """``log=True`` fits log(P / divisor) and exponentiates back: on a smooth target the two fits agree to the
+    fit's own accuracy, the prediction is strictly positive by construction, and the option travels with the
+    section (its state, hence a file and a cache key). Files written before the option read back as trained."""
+    plain = _fourier_emulator().train(budget=2)
+    logged = _fourier_emulator(log=True).train(budget=2)
+    assert plain.log is False and logged.log is True
+    point = {'omega_cdm': 0.1234, 'n_s': 0.965, 'logA': 3.04}
+    truth = np.asarray(plain.compute(point)['pk.delta_m'])
+    for emulator in (plain, logged):
+        predicted = np.asarray(emulator.predict(**point)['pk.delta_m'])
+        np.testing.assert_allclose(predicted, truth, rtol=5e-3)
+        assert np.all(predicted > 0.)
+    # what the engine was fitted to differs by exactly the log
+    params = dict(point)
+    values = plain.compute(params)
+    np.testing.assert_allclose(np.asarray(logged.transform(values, params)['pk.delta_m']),
+                               np.log(np.asarray(plain.transform(values, params)['pk.delta_m'])), rtol=0., atol=1e-12)
+    assert logged.section_options()['log'] is True and plain.section_options()['log'] is False
+    again = read(logged.write(str(tmp_path / 'log.h5')))
+    assert again.log is True
+    np.testing.assert_allclose(np.asarray(again.predict(**point)['pk.delta_m']),
+                               np.asarray(logged.predict(**point)['pk.delta_m']), rtol=0., atol=0.)
+    # a state without the key (a file from before the option) falls back to the class default
+    state = logged.__getstate__()
+    state['section_options'] = {key: value for key, value in state['section_options'].items() if key != 'log'}
+    old = type(logged).__new__(type(logged)); old.__setstate__(state)
+    assert old.log is False
+
+
+def test_a_composite_applies_the_log_to_its_own_section_only():
+    """`CosmologyEmulator` reuses the section's `transform` pair: the log must follow the section behind each
+    output (the fourier one asked for it, the background did not), and a composite without the option must
+    behave as before, attribute and all."""
+    from cosmoprimo.fiducial import DESI
+    space = Space(bounds={'omega_cdm': (0.11, 0.13), 'logA': (2.9, 3.2)})
+    z = np.array([0., 1.])
+    fourier = {'k': np.geomspace(1e-3, 1., 40), 'z': z}
+    plain = Emulator(DESI(engine='eisenstein_hu'), space, section={'fourier': fourier, 'background': {'z': z}}).train(budget=1)
+    logged = Emulator(DESI(engine='eisenstein_hu'), space,
+                      section={'fourier': {**fourier, 'log': True}, 'background': {'z': z}}).train(budget=1)
+    assert logged._logged('fourier.pk.delta_m') and not logged._logged('background.efunc')
+    assert not plain._logged('fourier.pk.delta_m')
+    point = {'omega_cdm': 0.1234, 'logA': 3.04}
+    values = plain.compute(point)
+    for emulator in (plain, logged):
+        transformed = emulator.transform(values, point)
+        np.testing.assert_allclose(np.asarray(transformed['background.efunc']),
+                                   np.asarray(plain.transform(values, point)['background.efunc']), rtol=0., atol=1e-12)
+    np.testing.assert_allclose(np.asarray(logged.transform(values, point)['fourier.pk.delta_m']),
+                               np.log(np.asarray(plain.transform(values, point)['fourier.pk.delta_m'])), rtol=0., atol=1e-12)
+    for emulator in (plain, logged):
+        predicted = emulator.predict(**point)
+        np.testing.assert_allclose(np.asarray(predicted['fourier.pk.delta_m']), np.asarray(values['fourier.pk.delta_m']), rtol=2e-2)
+        np.testing.assert_allclose(np.asarray(predicted['background.efunc']), np.asarray(values['background.efunc']), rtol=1e-6)
+        cosmo = emulator.to_cosmology().clone(**point)
+        assert np.all(np.isfinite(cosmo.get_fourier().pk_interpolator()(np.geomspace(2e-3, 0.5, 10), 0.5)))
+
+
+def test_the_log_fit_survives_the_dilation_s_extrapolation():
+    """With ``dilate=True`` the spectrum is read beyond its k grid at one end (k s past the last node for s < 1), where
+    a cubic extrapolation of a k^-3 tail overshoots to negative values: harmless to a fit in the value, nan to a log
+    taken after it (586 of 6006 nodes dropped on the DESI w0wa box, 2026-11-05). The log is therefore taken before the
+    dilation, and a dilated log fit trains on every node and predicts a finite, positive spectrum that agrees with the
+    dilated plain fit."""
+    space = Space(bounds={'omega_cdm': (0.11, 0.13), 'h': (0.50, 0.85)})
+    from cosmoprimo.fiducial import DESI
+    make = lambda **options: Emulator(DESI(engine='eisenstein_hu'), space, section='fourier',
+                                      k=np.geomspace(1e-4, 10., 300), z=np.array([0., 1.]), dilate=True, **options)
+    # the Chebyshev grid refuses a non-finite node outright, so training at all is the proof that no node was lost
+    plain, logged = make().train(budget=2), make(log=True).train(budget=2)
+    for h in (0.52, 0.67, 0.83):
+        point = {'omega_cdm': 0.12, 'h': h}
+        truth = np.asarray(plain.compute(point)['pk.delta_m'])
+        for emulator in (plain, logged):
+            predicted = np.asarray(emulator.predict(**point)['pk.delta_m'])
+            assert np.all(np.isfinite(predicted)) and np.all(predicted > 0.)
+            # the resampled ends are where the two can differ; the body of the spectrum agrees with the truth
+            inside = slice(5, -5)
+            np.testing.assert_allclose(predicted[inside], truth[inside], rtol=2e-2)
+    # the transform of the log fit is log(P / divisor) dilated, minus 3 log s -- the plain one dilated and divided by s^3
+    point = {'omega_cdm': 0.12, 'h': 0.52}
+    values = plain.compute(point)
+    a, b = np.asarray(logged.transform(values, point)['pk.delta_m']), np.asarray(plain.transform(values, point)['pk.delta_m'])
+    assert np.all(np.isfinite(a)) and np.all(np.isfinite(b))
+    # where the plain transform stays positive the two agree (the resampled end, where it may overshoot, is left out)
+    body = b > 0.
+    body[:10] = body[-10:] = False     # k s runs 0.1 decades past the grid at h = 0.52: ~6 of 60 points per decade
+    np.testing.assert_allclose(np.exp(a[body]), b[body], rtol=5e-2)

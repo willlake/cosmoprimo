@@ -308,12 +308,28 @@ class SectionEmulator(_Emulator):
         w0waCDM analysis actually bounds: CAMB's PPF refuses :math:`w_0 + w_a > 0` ("giving
         w > 0 at high redshift"), no per-axis limit expresses that, and a Smolyak grid is
         unisolvent, so one node past the bound is not a smaller problem but a singular one.
+    log : bool, default=False
+        Fit the logarithm of each output -- of what is left after the divisor (:meth:`scaling`)
+        and the dilation, which is what the engine would otherwise see -- and exponentiate at
+        prediction. For strictly positive outputs, power spectra above all: a regression in the
+        value itself can overshoot to a negative number where the output is small and its
+        parameter dependence steep, and a negative entry in a spectrum poisons the whole log-log
+        spline that serves it (one point of 117 on an EFT-of-dark-energy w0waCDM box, DESI-DR2-MG
+        CosmoPolyEmu, 2026-11-05: P(k = 1.7e-4) predicted at -86, every k then NaN). In the log
+        the prediction cannot change sign, and the least squares weighs each entry by its
+        relative rather than absolute error. A non-positive training value makes its node
+        non-finite, so this is not for outputs that cross zero (a TE cross spectrum). Saved with
+        the section; files written before the option read back as trained.
     """
     section = None
 
-    def __init__(self, cosmo, space, basis=None, **options):
+    #: files written before the option read back with the behaviour they were trained with
+    log = False
+
+    def __init__(self, cosmo, space, basis=None, log=False, **options):
         self.cosmo = cosmo
         self.basis = _get_basis(basis)
+        self.log = bool(log)
         # analytic backgrounds already built, see `analytic_background`. A dict rather than one
         # entry, because the sections of a composite share it and each may ask at its own
         # parameters, and shared rather than per section because they all clone the same fiducial.
@@ -658,21 +674,42 @@ class SectionEmulator(_Emulator):
             # k-dependent, so the order is part of the definition and `inverse_transform` undoes
             # it in reverse. Dividing the tilt here, where `k h` is the live one, is what leaves
             # the dilated spectrum's primordial factor h-free
+            logged = self._logged(name)
             if name in factors:
                 value = value / factors[name]
+            # the log between the factor and the dilation: a strictly positive residual (a spectrum
+            # over its divisor) fitted in the log cannot be predicted negative, and the least
+            # squares then weighs every entry by its relative, not absolute, error. Before the
+            # dilation, not after: the dilation reads the spectrum beyond its grid at one end (k s
+            # past the last node for s < 1), where a cubic extrapolation of a spectrum falling as
+            # k^-3 overshoots -- -7e6 against +1e8 at k = 10 h/Mpc for h = 0.50 on a DESI box
+            # (2026-11-05), harmless to a fit in the value, nan to a log of it. log P is close to
+            # linear in log k at both ends, so dilating the log extrapolates benignly.
+            if logged:
+                value = jnp.log(value)
             if name in dilations:
                 k, scale = dilations[name]
-                value = dilate(k, value, 1. / scale, axis=0) / scale**3
+                value = dilate(k, value, 1. / scale, axis=0)
+                value = value - 3. * jnp.log(scale) if logged else value / scale**3
             out[name] = value
         return out
+
+    def _logged(self, name):
+        """Whether output *name* is fitted in the log (:attr:`log`); per name, so that a composite
+        can answer for each of its sections, as :meth:`scaling` and :meth:`dilation` do."""
+        return self.log
 
     def inverse_transform(self, values, params):
         factors, dilations = self.scaling(params), self.dilation(params)
         out = {}
         for name, value in values.items():
+            logged = self._logged(name)
             if name in dilations:
                 k, scale = dilations[name]
-                value = scale**3 * dilate(k, value, scale, axis=0)
+                value = value + 3. * jnp.log(scale) if logged else scale**3 * value
+                value = dilate(k, value, scale, axis=0)
+            if logged:
+                value = jnp.exp(value)
             if name in factors:
                 value = value * factors[name]
             out[name] = value
@@ -696,7 +733,7 @@ class SectionEmulator(_Emulator):
         not called ``options``: :class:`~cosmoprimo.emulators.tools.Emulator` already keeps the
         engine options under that name, and a method would be shadowed by the attribute.
         """
-        return {'basis': self.basis}
+        return {'basis': self.basis, 'log': self.log}
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -1726,6 +1763,12 @@ class CosmologyEmulator(_Emulator):
     # and that section agree
     transform = SectionEmulator.transform
     inverse_transform = SectionEmulator.inverse_transform
+
+    def _logged(self, name):
+        # the section behind the output answers (its `log`); a section from a file written
+        # before the option has the class default, False
+        section = self.sections.get(name.split('.', 1)[0], None)
+        return bool(getattr(section, 'log', False))
 
     def to_cosmology(self):
         if not self.trained:
