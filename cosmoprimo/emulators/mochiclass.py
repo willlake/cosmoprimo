@@ -146,7 +146,8 @@ __all__ = ['stable', 'stable_hill_valley', 'stable_propto_omega', 'hill_valley_r
            'min_cs2num_hill_valley', 'min_cs2num_propto_omega',
            'cs2num', 'kinetic_D', 'background', 'default_a_grid',
            'alphas_hill_valley', 'alphas_propto_omega',
-           'ic_growth_exponent', 'IC_Z_REF', 'IC_TOLERANCE']
+           'ic_growth_exponent', 'IC_Z_REF', 'IC_TOLERANCE',
+           'eft_finite_coefficients', 'eft_interpolators', 'EFT_FINITE_KEYS', 'EFT_NA_PROPTO_OMEGA', 'XNOW']
 
 #: mochi_class' ``pert_ic_ini_z_ref_smg``: the redshift at which ``test_ini_extfld_ic_smg``
 #: evaluates the superhorizon attractor (``include/precisions.h``).
@@ -1284,3 +1285,205 @@ def stable(gravity_model, parameters_smg, ic_test=False, qs_mu2=False, qs_pole=F
         return stable_propto_omega(c_b, c_m, c_t=c_t, M2_ini=M2_ini, alpha_K=aK, ic_test=ic_test, qs_mu2=qs_mu2, qs_pole=qs_pole, **cosmo)
     raise ValueError("gravity_model must be 'hill_valley' ('no_slip_gravity') or "
                      "'propto_omega', got {!r}".format(gravity_model))
+
+
+# --------------------------------------------------------------------------------------
+# The quasi-static source of fkptjax, in closed form
+# --------------------------------------------------------------------------------------
+#: fkptjax's integration start, :math:`\eta = \ln a` (:math:`z \simeq 49`); the default grid of
+#: :func:`eft_interpolators` starts 0.2 below it, as ``cosmoprimo.mochiclassy.Background.eft_interpolators``.
+XNOW = -3.912023
+
+#: Points of :func:`default_a_grid` on which :func:`eft_finite_coefficients` integrates propto_omega's
+#: :math:`M_{\ast}^{2}`. The integral's error is second order in the late-time spacing: measured against
+#: mochi_class (c_m = 0.81), :math:`h_{1}` at z = 0.05 is off by 1.5e-5 with 512 points (spacing 0.018 in ln a)
+#: and 2.5e-7 with 4096, at a few ms per call.
+EFT_NA_PROPTO_OMEGA = 4096
+
+#: fkptjax's keys of the finite coefficients (``fkptjax.ode``, desilike's ``FKPTJAXPTSpectrum2Poles``).
+EFT_FINITE_KEYS = {'h1': 'eftde_h1_interp', 'D0': 'eftde_d0_interp', 'N3': 'eftde_n3_interp', 'N5': 'eftde_n5_interp'}
+
+
+def _split_parameters_smg(gravity_model, parameters_smg):
+    """``(model, coefficients)`` from mochi_class' ``gravity_model`` / ``parameters_smg`` pair (last axis), as :func:`stable`."""
+    xnp = numpy_jax(parameters_smg)
+    p = xnp.asarray(parameters_smg, dtype='f8')
+    if gravity_model in ('hill_valley', 'no_slip_gravity'):
+        if p.shape[-1] != 6:
+            raise ValueError('hill_valley expects parameters_smg = [alpha_K, c_M, tau, a_t, r, M2_ini] on the last axis, '
+                             'got {}'.format(p.shape))
+        return 'hill_valley', dict(zip(('alpha_K', 'c_M', 'tau', 'a_t', 'r', 'M2_ini'), (p[..., i] for i in range(6))))
+    if gravity_model == 'propto_omega':
+        if p.shape[-1] != 5:
+            raise ValueError('propto_omega expects parameters_smg = [alpha_K, c_b, c_m, c_t, M2_ini] on the last axis, '
+                             'got {}'.format(p.shape))
+        return 'propto_omega', dict(zip(('alpha_K', 'c_b', 'c_m', 'c_t', 'M2_ini'), (p[..., i] for i in range(5))))
+    raise ValueError("gravity_model must be 'hill_valley' ('no_slip_gravity') or 'propto_omega', got {!r}".format(gravity_model))
+
+
+def eft_finite_coefficients(gravity_model, parameters_smg, eta, noslip=None, na=EFT_NA_PROPTO_OMEGA, **cosmo):
+    r"""
+    The finite coefficients of the quasi-static source, in closed form, at :math:`\eta = \ln a`:
+
+    .. math:: \mu(k, \eta) = h_{1}\,\frac{D_{0} + N_{5} k^{2}}{D_{0} + N_{3} k^{2}},\qquad
+              h_{1} = \frac{1 + \alpha_{T}}{M_{\ast}^{2}},\quad D_{0} = a^{2} H^{2} \mu^{2},\quad
+              N_{3} = c_{s}^{2}{\rm num},\quad N_{5} = \frac{1 + \alpha_{M}}{1 + \alpha_{T}}\,\alpha_{1} + \alpha_{2}
+
+    -- the same definitions as ``cosmoprimo.mochiclassy.Background._eft_finite_coefficients`` (see there for
+    why this form, and eq. 62-69 of arXiv:1902.06978), built from this module's analytic background
+    (:func:`background`, exact w0waCDM with massive neutrinos) and closed-form alphas
+    (:func:`alphas_hill_valley`, :func:`alphas_propto_omega`) instead of a mochi_class table. So it costs
+    microseconds and needs no Boltzmann code, which is what lets an emulated (mochi_class-free) cosmology feed
+    fkptjax's one-loop kernels.
+
+    The ingredients are those of the gate's :func:`_qs_mu2`: :math:`\xi = H'/H = -\tfrac{3}{2}(\rho + p)_{\rm
+    tot} / H^{2}`, :math:`p_{\rm tot}' / H^{2}` including the smg fluid, :math:`\alpha_{1} = \alpha_{B} +
+    (\alpha_{B} - 2) \alpha_{T} + 2 \alpha_{M}`, :math:`\alpha_{2} = c_{s}^{2}{\rm num} - (2 - \alpha_{B})
+    \alpha_{1} / 2`, :math:`\mu^{2} = -3 [\alpha_{B} (\xi \alpha_{M} - \tfrac{3}{2} p_{\rm tot}'/H^{2}) + \xi
+    \alpha_{2}]`.
+
+    No-slip (:math:`\alpha_{B} = -2 \alpha_{M}`, :math:`\alpha_{T} = 0`: hill_valley at ``r = 2``,
+    propto_omega at ``c_b = -2 c_m``, ``c_t = 0``) has :math:`\alpha_{1} = 0` exactly in floating point,
+    hence :math:`N_{5} = N_{3}` bit for bit and :math:`\mu = h_{1}` at every :math:`k`. With concrete inputs
+    and ``noslip=None`` that is detected and ``N5`` is returned as the same array as ``N3``, as the engine
+    does; ``True`` / ``False`` force / forbid it. Under a jax trace ``None`` leaves the formula, which gives
+    the identical values anyway, and the returned flag is ``None``.
+
+    Parameters
+    ----------
+    gravity_model : str
+        ``'hill_valley'`` (alias ``'no_slip_gravity'``) or ``'propto_omega'``.
+    parameters_smg : array_like
+        mochi_class' order on the last axis, as :func:`stable`: ``[alpha_K, c_M, tau, a_t, r, M2_ini]``
+        (hill_valley) or ``[alpha_K, c_b, c_m, c_t, M2_ini]`` (propto_omega). ``alpha_K`` does not enter the
+        quasi-static source.
+    eta : array_like
+        :math:`\ln a` nodes, a fixed (numpy) grid, of any shape. The parameters (``parameters_smg`` without its
+        last axis, and ``cosmo``) broadcast to a batch shape, and the outputs have shape ``batch + eta.shape``.
+    noslip : bool, default=None
+        Force / forbid / detect the no-slip identification ``N5 is N3``.
+    na : int, default=EFT_NA_PROPTO_OMEGA
+        propto_omega only: points of :func:`default_a_grid` on which :math:`M_{\ast}^{2} = M^{2}_{\ast,\rm ini}
+        \exp(\int \alpha_{M} d\ln a)` is integrated from :data:`A_INI` (``eta``'s own points are added to it),
+        see :data:`EFT_NA_PROPTO_OMEGA`. hill_valley's :math:`M_{\ast}^{2}` is closed form.
+    **cosmo
+        The background, as :func:`background`: ``h``, ``omega_b``, ``omega_cdm``, ``w0``, ``wa``, ``m_ncdm``,
+        ``deg_ncdm``, ``T_ncdm``, ``N_ur``, ``T_cmb``, ``omega_ncdm``, ``Omega_smg``.
+
+    Returns
+    -------
+    coefficients : dict
+        ``h1`` (unitless), ``D0`` (:math:`(h/{\rm Mpc})^{2}`), ``N3``, ``N5`` (unitless, so :math:`k` in
+        :math:`h/{\rm Mpc}`), plus ``alpha_1``, ``mu2``, ``cs2num``, ``aH`` (:math:`h/{\rm Mpc}`) and the
+        ``noslip`` flag -- the keys of ``mochiclassy.Background._eft_finite_coefficients``. numpy or jax.numpy,
+        chosen from the inputs.
+    """
+    bad = set(cosmo) - set(_COSMO_KEYS)
+    if bad:
+        raise TypeError('unexpected argument(s) {}; expected one of {}'.format(sorted(bad), list(_COSMO_KEYS)))
+    model, c = _split_parameters_smg(gravity_model, parameters_smg)
+    xnp = numpy_jax(parameters_smg, *cosmo.values())
+    eta = np.asarray(eta, dtype='f8')
+    shape = eta.shape
+    eta = eta.ravel()
+    # the eta axis goes last: every parameter gets a trailing axis of size 1
+    c = {name: value[..., None] for name, value in c.items()}
+    # (T_cmb, T_ncdm and deg_ncdm are constants of the background, used as plain numbers there)
+    cosmo = {name: value if value is None or name in ('T_cmb', 'T_ncdm', 'deg_ncdm') else xnp.asarray(value, dtype='f8')[..., None]
+             for name, value in cosmo.items()}
+    if model == 'hill_valley':
+        a = np.exp(eta)
+        bg = background(a, derivs=True, **cosmo)
+        aB, aM, aT, daB, M2 = alphas_hill_valley(a, c['c_M'], c['tau'], c['a_t'], c['r'], c['M2_ini'])
+    else:
+        # M_*^2 is integrated from A_INI: run on the default grid with eta's own points added, then pick them
+        lna_grid = np.union1d(np.log(default_a_grid(na)), eta)
+        index = np.searchsorted(lna_grid, eta)
+        a_grid = np.exp(lna_grid)
+        bg_grid = background(a_grid, derivs=True, **cosmo)
+        al = alphas_propto_omega(a_grid, lna_grid, bg_grid, c['c_b'], c['c_m'], c['c_t'], c['M2_ini'])
+        a = a_grid[index]
+        bg = {name: value[..., index] for name, value in bg_grid.items()}
+        aB, aM, aT, daB, M2 = (value[..., index] for value in al)
+    cs2 = cs2num(aB, aM, aT, daB, M2, bg['X_m'], bg['X_de'])
+    xi = -1.5 * (bg['X_m'] + bg['X_de'])
+    dp = bg['dp_wo'] + bg['dp_de']
+    alpha_1 = aB + (aB - 2.) * aT + 2. * aM
+    alpha_2 = cs2 - (2. - aB) * alpha_1 / 2.
+    mu2 = -3. * (aB * (xi * aM - 1.5 * dp) + xi * alpha_2)
+    aH = a * xnp.sqrt(bg['E2']) * _H0_OVER_H
+    N3 = cs2
+    N5 = (1. + aM) / (1. + aT) * alpha_1 + alpha_2
+    if noslip is None and not use_jax(alpha_1, tracer_only=True):
+        noslip = bool(np.all(np.asarray(alpha_1) == 0.))
+    toret = {'h1': (1. + aT) / M2, 'D0': aH**2 * mu2, 'N3': N3, 'N5': N5, 'alpha_1': alpha_1, 'mu2': mu2, 'aH': aH}
+    # (batch..., eta.size) -> (batch..., *eta's shape)
+    full = np.broadcast_shapes(*(np.shape(value) for value in toret.values()))
+    toret = {name: xnp.broadcast_to(value, full).reshape(full[:-1] + shape) for name, value in toret.items()}
+    toret['cs2num'] = toret['N3']
+    if noslip:
+        toret['N5'] = toret['N3']
+    toret['noslip'] = None if (noslip is None) else bool(noslip)
+    return toret
+
+
+def eft_interpolators(gravity_model, parameters_smg, eta=None, xnow=XNOW, extrapolate=True, noslip=None, **cosmo):
+    r"""
+    The closed-form quasi-static source (:func:`eft_finite_coefficients`) as fkptjax's interpolators: the
+    keys, grid, units and spline type of ``cosmoprimo.mochiclassy.Background.eft_interpolators()`` (finite
+    representation), for one model with concrete (numpy) parameters -- what a pt node calls inside its
+    external callback.
+
+    Parameters
+    ----------
+    gravity_model, parameters_smg, **cosmo
+        As :func:`eft_finite_coefficients`; one model (``parameters_smg`` of shape ``(6,)`` or ``(5,)``).
+    eta : array_like, default=None
+        :math:`\ln a` nodes. Default is 512 points on ``[xnow - 0.2, 0]``.
+    xnow : float, default=XNOW
+        fkptjax's integration start; only used to build the default grid.
+    extrapolate : bool, default=True
+        Passed to :class:`scipy.interpolate.CubicSpline` (fkptjax probes slightly outside the grid).
+    noslip : bool, default=None
+        As :func:`eft_finite_coefficients`. No-slip returns the SAME spline object for N3 and N5, so that
+        fkptjax's ``N5 == N3`` test takes :math:`\mu = h_{1}`.
+
+    Returns
+    -------
+    interpolators : dict
+        ``{'eftde_h1_interp', 'eftde_d0_interp', 'eftde_n3_interp', 'eftde_n5_interp'}``, scipy CubicSplines
+        of :math:`\eta`; :math:`D_{0}` in :math:`(h/{\rm Mpc})^{2}`, the rest unitless.
+
+    Raises
+    ------
+    CosmologyComputationError
+        If a coefficient is not finite on the grid.
+    """
+    from scipy.interpolate import CubicSpline
+    from cosmoprimo.cosmology import CosmologyComputationError
+    if use_jax(parameters_smg, *cosmo.values(), tracer_only=True):
+        raise TypeError('eft_interpolators builds scipy splines and takes concrete parameters; '
+                        'under a trace use eft_finite_coefficients')
+    if eta is None:
+        eta = np.linspace(xnow - 0.2, 0., 512)
+    eta = np.unique(np.asarray(eta, dtype='f8').ravel())
+    if eta.size < 2:
+        raise ValueError('eta grid must contain at least 2 distinct points, got {:d}'.format(eta.size))
+    parameters_smg = np.asarray(parameters_smg, dtype='f8')
+    if parameters_smg.ndim != 1:
+        raise ValueError('eft_interpolators takes one model, got parameters_smg of shape {}'.format(parameters_smg.shape))
+    cosmo = {name: np.asarray(value, dtype='f8') if value is not None else None for name, value in cosmo.items()}
+    values = eft_finite_coefficients(gravity_model, parameters_smg, eta, noslip=noslip, **cosmo)
+    toret = {}
+    for name, key in EFT_FINITE_KEYS.items():
+        value = np.asarray(values[name], dtype='f8')
+        finite = np.isfinite(value)
+        if not np.all(finite):
+            bad = eta[~finite]
+            raise CosmologyComputationError('{}(eta) is not finite at {:d} of {:d} nodes, for eta in [{:.4f}, {:.4f}]; '
+                                            'check the smg / EFT parameters'.format(name, bad.size, eta.size, bad.min(), bad.max()))
+        if name == 'N5' and values['noslip']:
+            toret[key] = toret[EFT_FINITE_KEYS['N3']]   # no-slip: N5 IS N3, the same spline object
+            continue
+        toret[key] = CubicSpline(eta, value, extrapolate=extrapolate)
+    return toret
