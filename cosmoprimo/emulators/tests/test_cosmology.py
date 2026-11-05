@@ -433,6 +433,35 @@ def test_the_primordial_spectrum_leaves_the_background_and_thermodynamics_grids(
     assert Emulator(fiducial(), space8, section={'background': {'z': z}}).params == ['h']
 
 
+def test_the_dark_energy_stays_on_the_grid_only_when_asked():
+    """With the analytic divisor on, w0 and wa leave the fourier and thermodynamics grids (the divisor carries
+    them) -- unless ``exact_dark_energy=False``, for an engine whose growth is not GR's or a box where the dark
+    energy clusters. The background never expands them (its ratio to the analytic one is 1), and the option is
+    saved with the section so a file replays it."""
+    space = Space(bounds={'h': (0.6, 0.8), 'omega_cdm': (0.10, 0.14), 'logA': (2.0, 3.7),
+                          'w0_fld': (-1.6, 0.6), 'wa_fld': (-3., 1.1)})
+    k, z = np.geomspace(1e-3, 1., 32), np.linspace(0., 2., 4)
+    fiducial = lambda: Cosmology(engine='class')
+    fourier, thermo, background = {'k': k, 'z': z, 'dilate': True}, {}, {'z': z}
+    default = Emulator(fiducial(), space, section={'fourier': fourier, 'background': background, 'thermodynamics': thermo})
+    assert default.params == ['h', 'omega_cdm'] and sorted(default.exact_params) == ['logA', 'w0_fld', 'wa_fld']
+    on_grid = Emulator(fiducial(), space, section={'fourier': {**fourier, 'exact_dark_energy': False}, 'background': background,
+                                                   'thermodynamics': {**thermo, 'exact_dark_energy': False}})
+    assert on_grid.params == ['h', 'omega_cdm', 'w0_fld', 'wa_fld'] and on_grid.exact_params == ['logA']
+    # one section asking is enough to put them on the shared node set
+    fourier_only = Emulator(fiducial(), space, section={'fourier': {**fourier, 'exact_dark_energy': False}, 'background': background})
+    assert fourier_only.params == ['h', 'omega_cdm', 'w0_fld', 'wa_fld']
+    assert Emulator(fiducial(), space, section={'thermodynamics': {'exact_dark_energy': False}}).params == ['h', 'omega_cdm', 'w0_fld', 'wa_fld']
+    # with analytic=False the dark energy is on the grid whatever the option says
+    assert Emulator(fiducial(), space, section={'fourier': {**fourier, 'analytic': False}}).params == ['omega_cdm', 'w0_fld', 'wa_fld']
+    # the option is part of the section's saved state, for the file and for a cache key (the background has none:
+    # it never expands the dark energy)
+    for emulator, value in ((on_grid, False), (default, True)):
+        for name, section in emulator.sections.items():
+            if name != 'background':
+                assert section.section_options()['exact_dark_energy'] is value, (name, value)
+
+
 def test_multi_section_to_cosmology_serves_every_section(multi):
     cosmo = multi.to_cosmology().clone(**POINT)
     predicted = multi.predict(**POINT)
