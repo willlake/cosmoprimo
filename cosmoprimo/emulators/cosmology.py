@@ -71,6 +71,18 @@ _SPECTRA = {'lensed_cl': ('tt', 'ee', 'bb', 'te'),
 #: two the space is written in, it is the same single number that scales out.
 _SIGMA8 = ('sigma8',) + tuple(Cosmology._alias_parameters.get('sigma8', ()))
 
+#: The primordial spectrum in every spelling -- amplitude (sigma8 included) and tilt. No background
+#: quantity and no recombination scalar depends on it, so the background and thermodynamics sections
+#: leave it off their grid; in a composite it then costs a node only where a section really expands
+#: it (the lensed Cl, the non-linear spectrum). Left on, a fourier + background + thermodynamics
+#: emulator put logA and n_s on the shared node set although the fourier section handles both exactly:
+#: a 6-D grid instead of 4-D for the EFT-of-DE full-shape box (3003 terms at total degree 8 against 495).
+_PRIMORDIAL = _AMPLITUDES + _SIGMA8 + ('n_s',) + tuple(Cosmology._alias_parameters.get('n_s', ()))
+
+#: Reionization in every spelling: the background does not see it. The thermodynamics section keeps it,
+#: since CLASS integrates the drag optical depth from z = 0, so the reionized electrons reach `z_drag`.
+_REIONIZATION = ('tau_reio', 'z_reio') + tuple(Cosmology._alias_parameters.get('tau_reio', ()))
+
 
 def _guard(values):
     r"""*values* where they can be divided by, and 1 where they cannot.
@@ -1043,9 +1055,13 @@ class BackgroundEmulator(SectionEmulator):
         background is what the divisor already does, and a node spent on them buys nothing.
 
         It also keeps the grid off `w0 + wa > 1/3`, which CLASS refuses outright.
+
+        The primordial spectrum and reionization (:data:`_PRIMORDIAL`, :data:`_REIONIZATION`) go
+        whatever ``analytic`` says: no background quantity depends on them at all.
         """
+        names = [name for name in names if name not in _PRIMORDIAL + _REIONIZATION]
         if not self.analytic:
-            return list(names)
+            return names
         return [name for name in names if name not in DARK_ENERGY]
 
     def scaling(self, params):
@@ -1479,9 +1495,13 @@ class ThermodynamicsEmulator(SectionEmulator):
         The angular scales are the exception in principle -- an angle divides by a distance,
         which the dark energy does move -- but ``analytic`` divides by the analytic background's
         own distance to the same epoch, so that part is removed rather than interpolated.
+
+        The primordial spectrum (:data:`_PRIMORDIAL`) goes whatever ``analytic`` says: recombination
+        and the drag epoch do not depend on it. Reionization stays (:data:`_REIONIZATION`).
         """
+        names = [name for name in names if name not in _PRIMORDIAL]
         if not self.analytic:
-            return list(names)
+            return names
         return [name for name in names if name not in DARK_ENERGY]
 
     def scaling(self, params):

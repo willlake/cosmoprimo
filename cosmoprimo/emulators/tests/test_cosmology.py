@@ -409,6 +409,30 @@ def test_a_parameter_leaves_the_grid_only_if_every_section_is_exact():
     assert together.exact_params == [] and together.params == ['h', 'logA']
 
 
+def test_the_primordial_spectrum_leaves_the_background_and_thermodynamics_grids():
+    """No distance, growth or recombination scalar depends on the amplitude or the tilt, so a full-shape
+    composite (fourier + background + thermodynamics) keeps them off the shared node set: before, the two
+    sections put logA and n_s on it although the fourier section handles both exactly (a 6-D grid instead
+    of 4-D for the EFT-of-DE box). Reionization leaves the background only: the drag optical depth is
+    integrated from z = 0."""
+    space = Space(bounds={'h': (0.6, 0.8), 'omega_cdm': (0.10, 0.14), 'logA': (2.0, 3.7), 'n_s': (0.7, 1.3),
+                          'tau_reio': (0.03, 0.08)})
+    k, z = np.geomspace(1e-3, 1., 32), np.linspace(0., 2., 4)
+    # nothing is computed here, only the node set is decided: any engine with these sections will do
+    fiducial = lambda: Cosmology(engine='class')
+    sections = {'fourier': {'k': k, 'z': z, 'dilate': True}, 'background': {'z': z}, 'thermodynamics': {}}
+    together = Emulator(fiducial(), space, section=sections)
+    assert together.params == ['h', 'omega_cdm', 'tau_reio']
+    assert sorted(together.exact_params) == ['logA', 'n_s']
+    assert Emulator(fiducial(), space, section={'background': {'z': z}}).params == ['h', 'omega_cdm']
+    assert Emulator(fiducial(), space, section='thermodynamics').params == ['h', 'omega_cdm', 'tau_reio']
+    # and without the analytic divisor too: it is the dark energy that analytic=False puts back, not these
+    assert Emulator(fiducial(), space, section={'background': {'z': z, 'analytic': False}}).params == ['h', 'omega_cdm']
+    # sigma8 is the amplitude under another name
+    space8 = Space(bounds={'h': (0.6, 0.8), 'sigma8': (0.7, 0.9)})
+    assert Emulator(fiducial(), space8, section={'background': {'z': z}}).params == ['h']
+
+
 def test_multi_section_to_cosmology_serves_every_section(multi):
     cosmo = multi.to_cosmology().clone(**POINT)
     predicted = multi.predict(**POINT)
